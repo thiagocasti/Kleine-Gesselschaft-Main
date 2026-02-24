@@ -1,0 +1,225 @@
+package utilidades.network;
+
+import utilidades.interfaces.GameController;
+
+import java.io.IOException;
+import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
+
+public class ServerThread extends Thread {
+
+    private DatagramSocket socket;
+    private int serverPort = 5555;
+    private boolean end = false;
+    private static final long CLIENT_TIMEOUT_MS = 7000L;
+    private final int MAX_CLIENTS = 3;
+    private int connectedClients = 0;
+    private ArrayList<Client> clients = new ArrayList<Client>();
+    private GameController gameController;
+    private boolean ready = false;
+    private final Map<Integer, float[]> positions = new HashMap<>();
+    private final Map<Integer, String> playerMaps = new HashMap<>();
+
+    public ServerThread(GameController gameController) {
+        this.gameController = gameController;
+        try {
+            socket = new DatagramSocket(serverPort);
+            socket.setSoTimeout(250);
+            ready = true;
+        } catch (SocketException e) {
+            ready = false;
+        }
+    }
+
+    @Override
+    public void run() {
+        if (!ready || socket == null || socket.isClosed()) return;
+        do {
+            DatagramPacket packet = new DatagramPacket(new byte[1024], 1024);
+            try {
+                socket.receive(packet);
+                processMessage(packet);
+                pruneInactiveClients();
+            } catch (SocketTimeoutException ignored) {
+                pruneInactiveClients();
+            } catch (IOException e) {
+//                throw new RuntimeException(e);
+            }
+        } while(!end);
+    }
+
+    private void processMessage(DatagramPacket packet) {
+        String message = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8).trim();
+        String[] parts = message.split(":");
+        int index = findClientIndex(packet);
+
+        if ("DiscoverServer".equalsIgnoreCase(parts[0])) {
+            sendMessage("ServerHere:" + serverPort, packet.getAddress(), packet.getPort());
+            return;
+        }
+
+        if(parts[0].equals("Connect")){
+
+            if(index != -1) {
+                System.out.println("Client already connected");
+                this.sendMessage("AlreadyConnected", packet.getAddress(), packet.getPort());
+                return;
+            }
+
+            if(connectedClients < MAX_CLIENTS) {
+                connectedClients++;
+                Client newClient = new Client(connectedClients, packet.getAddress(), packet.getPort());
+                clients.add(newClient);
+                sendMessage("Connected:"+connectedClients, packet.getAddress(), packet.getPort());
+                // Enviar posiciones conocidas al nuevo
+                for (Map.Entry<Integer, float[]> entry : positions.entrySet()) {
+                    float[] pos = entry.getValue();
+                    sendMessage("Move:"+entry.getKey()+":"+pos[0]+":"+pos[1], packet.getAddress(), packet.getPort());
+                    String knownMap = playerMaps.get(entry.getKey());
+                    if (knownMap != null && !knownMap.isEmpty()) {
+                        sendMessage("MapPos:"+entry.getKey()+":"+knownMap+":"+pos[0]+":"+pos[1], packet.getAddress(), packet.getPort());
+                    }
+                }
+
+                if(connectedClients == MAX_CLIENTS) {
+                    for(Client client : clients) {
+                        sendMessage("Start", client.getIp(), client.getPort());
+                        gameController.startGame();
+                    }
+                }
+
+            } else {
+                sendMessage("Full", packet.getAddress(), packet.getPort());
+            }
+        } else if(index==-1){
+            System.out.println("Client not connected");
+            this.sendMessage("NotConnected", packet.getAddress(), packet.getPort());
+            return;
+        } else {
+            Client client = clients.get(index);
+            client.touch();
+            switch(parts[0]){
+                case "Move":
+                    if (parts.length >= 3) {
+                        float x = Float.parseFloat(parts[1]);
+                        float y = Float.parseFloat(parts[2]);
+                        positions.put(client.getNum(), new float[]{x, y});
+                        gameController.move(client.getNum(), x, y);
+                        sendMessageToAll("Move:"+client.getNum()+":"+x+":"+y);
+                    }
+                    break;
+                case "MapPos":
+                    if (parts.length >= 4) {
+                        String mapName = parts[1].trim();
+                        float x = Float.parseFloat(parts[2]);
+                        float y = Float.parseFloat(parts[3]);
+                        if (!mapName.isEmpty()) {
+                            playerMaps.put(client.getNum(), mapName);
+                        }
+                        positions.put(client.getNum(), new float[]{x, y});
+                        sendMessageToAll("MapPos:"+client.getNum()+":"+mapName+":"+x+":"+y);
+                    }
+                    break;
+                case "Chat":
+                    String text = "";
+                    int colon = message.indexOf(':');
+                    if (colon != -1 && colon + 1 < message.length()) {
+                        text = message.substring(colon + 1).replace("\n"," ").replace("\r"," ").trim();
+                    }
+                    if (!text.isEmpty()) {
+                        sendMessageToAll("Chat:"+client.getNum()+":"+text);
+                    }
+                    break;
+                case "ClothingChange":
+                    String clothingName = "";
+                    int clothingColon = message.indexOf(':');
+                    if (clothingColon != -1 && clothingColon + 1 < message.length()) {
+                        clothingName = message.substring(clothingColon + 1)
+                            .replace("\n", " ")
+                            .replace("\r", " ")
+                            .trim();
+                    }
+                    if (!clothingName.isEmpty()) {
+                        String clothingMessage = "user (" + client.getNum() + ") cambio a ropa " + clothingName;
+                        System.out.println("Cambio de ropa: " + clothingMessage);
+                        sendMessageToAll("Chat:" + client.getNum() + ":" + clothingMessage);
+                    }
+                    break;
+                case "Disconnect":
+                    clients.remove(index);
+                    connectedClients = Math.max(0, connectedClients - 1);
+                    positions.remove(client.getNum());
+                    playerMaps.remove(client.getNum());
+                    sendMessageToAll("PlayerLeft:" + client.getNum());
+                    break;
+            }
+        }
+    }
+
+    private void pruneInactiveClients() {
+        if (clients.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        for (int i = clients.size() - 1; i >= 0; i--) {
+            Client client = clients.get(i);
+            if (now - client.getLastSeenMs() > CLIENT_TIMEOUT_MS) {
+                clients.remove(i);
+                connectedClients = Math.max(0, connectedClients - 1);
+                positions.remove(client.getNum());
+                playerMaps.remove(client.getNum());
+                sendMessageToAll("PlayerLeft:" + client.getNum());
+            }
+        }
+    }
+
+    private int findClientIndex(DatagramPacket packet) {
+        int i = 0;
+        int clientIndex = -1;
+        while(i < clients.size() && clientIndex == -1) {
+            Client client = clients.get(i);
+            String id = packet.getAddress().toString()+":"+packet.getPort();
+            if(id.equals(client.getId())){
+                clientIndex = i;
+            }
+            i++;
+
+        }
+        return clientIndex;
+    }
+
+    public void sendMessage(String message, InetAddress clientIp, int clientPort) {
+        byte[] byteMessage = message.getBytes();
+        DatagramPacket packet = new DatagramPacket(byteMessage, byteMessage.length, clientIp, clientPort);
+        try {
+            socket.send(packet);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public void terminate(){
+        this.end = true;
+        if (socket != null && !socket.isClosed()) socket.close();
+        this.interrupt();
+    }
+
+    public void sendMessageToAll(String message) {
+        for (Client client : clients) {
+            sendMessage(message, client.getIp(), client.getPort());
+        }
+    }
+
+    public void disconnectClients() {
+        for (Client client : clients) {
+            sendMessage("Disconnect", client.getIp(), client.getPort());
+        }
+        this.clients.clear();
+        this.connectedClients = 0;
+    }
+
+    public boolean isReady() {
+        return ready;
+    }
+}

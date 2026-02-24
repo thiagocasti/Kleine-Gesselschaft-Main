@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "java",
+      "name": "Current File (Terminal)",
+      "request": "launch",
+      "mainClass": "${file}",
+      "console": "integratedTerminal"
+    },
+    {
+      "type": "java",
+      "name": "Lwjgl3Launcher (Terminal)",
+      "request": "launch",
+      "mainClass": "io.github.some_example_name.lwjgl3.Lwjgl3Launcher",
+      "projectName": "Kleine-Gesselschaft-lwjgl3",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
